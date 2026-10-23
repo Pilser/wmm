@@ -13,6 +13,7 @@ use crate::events::{note_name, NoteStream};
 use crate::harmonize::{self, Mode as HarmonyMode, Options as HarmonyOptions};
 use crate::key::Key;
 use crate::midi;
+use crate::model::corpus::CorpusSplit;
 use crate::model::vocab::stream_to_events;
 use crate::model::{self, ModelConfig, SampleConfig, TrainConfig};
 use crate::render::{self, RenderOptions};
@@ -53,6 +54,8 @@ enum Command {
     Train(TrainArgs),
     /// Generate MIDI from a trained checkpoint.
     Sample(SampleArgs),
+    /// Average several checkpoints into one (data-parallel training workers).
+    Merge(MergeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -185,6 +188,20 @@ struct TrainArgs {
     /// Print progress every N steps.
     #[arg(long, default_value_t = 10)]
     log_every: usize,
+    /// Write an intermediate checkpoint every N steps (0 = only at the end).
+    #[arg(long, default_value_t = 0)]
+    save_every: usize,
+    /// Start from these weights (used by data-parallel workers so that their
+    /// weights can be averaged afterwards).
+    #[arg(long)]
+    init: Option<PathBuf>,
+    /// Only train on this manifest split (MAESTRO CSV index): train,
+    /// validation, test, or all. Default: all.
+    #[arg(long, default_value = "all")]
+    split: String,
+    /// Cap on windows used for the final train/validation report (0 = all).
+    #[arg(long, default_value_t = 512)]
+    eval_windows: usize,
     /// Random seed for shuffling and sampling.
     #[arg(long, default_value_t = 1)]
     seed: u64,
@@ -230,6 +247,7 @@ pub fn run() -> Result<()> {
         Command::Events(args) => run_events(args),
         Command::Train(args) => run_train(args),
         Command::Sample(args) => run_sample(args),
+        Command::Merge(args) => run_merge(args),
     }
 }
 
@@ -573,6 +591,10 @@ fn run_train(args: TrainArgs) -> Result<()> {
         max_steps: args.max_steps,
         max_minutes: args.max_minutes,
         log_every: args.log_every,
+        save_every: args.save_every,
+        init: args.init,
+        split: parse_split(&args.split)?,
+        eval_windows: args.eval_windows,
         seed: args.seed,
         ..TrainConfig::default()
     };
@@ -653,6 +675,39 @@ fn run_sample(args: SampleArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[derive(Debug, Args)]
+struct MergeArgs {
+    /// Checkpoints to average, given in any order.
+    #[arg(long, num_args = 1.., required = true)]
+    inputs: Vec<PathBuf>,
+    /// Output checkpoint.
+    #[arg(short, long)]
+    out: PathBuf,
+}
+
+fn run_merge(args: MergeArgs) -> Result<()> {
+    let report = model::merge(&args.inputs, &args.out)?;
+    println!(
+        "merged {} checkpoints ({} parameters, {} recorded steps) into {}",
+        report.inputs,
+        report.parameters,
+        report.steps,
+        args.out.display()
+    );
+    Ok(())
+}
+
+/// Parse the `--split` CLI value.
+fn parse_split(text: &str) -> Result<CorpusSplit> {
+    match text.trim().to_lowercase().as_str() {
+        "train" => Ok(CorpusSplit::Train),
+        "validation" | "val" => Ok(CorpusSplit::Validation),
+        "test" => Ok(CorpusSplit::Test),
+        "all" => Ok(CorpusSplit::All),
+        other => anyhow::bail!("unknown split {other:?}; expected train, validation, test, or all"),
+    }
 }
 
 fn resolve_soundfont(explicit: Option<PathBuf>) -> Result<PathBuf> {

@@ -8,6 +8,21 @@ use crate::dataset;
 use crate::midi;
 use crate::model::vocab::{stream_to_events, Event};
 
+/// Which part of a manifest (CSV index) to train on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorpusSplit {
+    Train,
+    Validation,
+    Test,
+    All,
+}
+
+impl CorpusSplit {
+    fn requires_manifest(self) -> bool {
+        !matches!(self, CorpusSplit::All)
+    }
+}
+
 /// Parsed performances, ready to be cut into windows.
 #[derive(Debug, Clone, Default)]
 pub struct Corpus {
@@ -20,9 +35,41 @@ pub struct Corpus {
 impl Corpus {
     /// Load up to `limit` MIDI files from a file or directory.
     pub fn load(path: &Path, limit: Option<usize>) -> Result<Self> {
+        Self::load_split(path, limit, CorpusSplit::All)
+    }
+
+    /// Load up to `limit` MIDI files, restricted to one manifest split when
+    /// `split` is not [`CorpusSplit::All`]. The manifest is the MAESTRO-style
+    /// `*.csv` index next to the files.
+    pub fn load_split(path: &Path, limit: Option<usize>, split: CorpusSplit) -> Result<Self> {
         let mut paths = dataset::find_midi_files(path)?;
         if paths.is_empty() {
             bail!("no MIDI files found under {}", path.display());
+        }
+        if split.requires_manifest() {
+            let manifest_path = dataset::find_manifest(path).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "split filtering needs a MAESTRO-style CSV index next to the files; none found under {}",
+                    path.display()
+                )
+            })?;
+            let manifest = dataset::Manifest::load(&manifest_path)?;
+            let wanted = match split {
+                CorpusSplit::Train => dataset::Split::Train,
+                CorpusSplit::Validation => dataset::Split::Validation,
+                CorpusSplit::Test => dataset::Split::Test,
+                CorpusSplit::All => unreachable!(),
+            };
+            let before = paths.len();
+            paths.retain(|p| manifest.split_for(p) == wanted);
+            if paths.is_empty() {
+                bail!(
+                    "no files in split {} under {} ({} files looked at)",
+                    wanted.as_str(),
+                    path.display(),
+                    before
+                );
+            }
         }
         if let Some(limit) = limit {
             paths.truncate(limit);

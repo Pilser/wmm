@@ -1,6 +1,8 @@
 /target
 /data
 /runs
+# Training artifacts copied back from the IICO machine. Never tracked.
+/artifacts
 /assets
 *.wav
 *.mid

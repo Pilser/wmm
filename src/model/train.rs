@@ -13,7 +13,7 @@ use candle_nn::loss::cross_entropy;
 use candle_nn::optim::{AdamW, Optimizer, ParamsAdamW};
 use candle_nn::{VarBuilder, VarMap};
 
-use crate::model::corpus::Corpus;
+use crate::model::corpus::{Corpus, CorpusSplit};
 use crate::model::gru::{count_parameters, EventModel, ModelConfig};
 use crate::model::rng::Rng;
 use crate::model::vocab::{Event, KIND_COUNT, KIND_START, PITCH_COUNT, TIME_BINS, VEL_BINS};
@@ -37,6 +37,16 @@ pub struct TrainConfig {
     /// Fraction of windows held out for validation.
     pub val_fraction: f64,
     pub seed: u64,
+    /// Start from these weights instead of a random initialisation.
+    pub init: Option<std::path::PathBuf>,
+    /// Restrict training to a manifest split (MAESTRO CSV index).
+    pub split: CorpusSplit,
+    /// Cap on windows used by the final quality report (0 = all).
+    ///
+    /// Without this, a multi-hour run pays for a second full pass at the end.
+    pub eval_windows: usize,
+    /// Write an intermediate checkpoint every N steps (0 = only at the end).
+    pub save_every: usize,
 }
 
 impl Default for TrainConfig {
@@ -54,6 +64,10 @@ impl Default for TrainConfig {
             log_every: 10,
             val_fraction: 0.05,
             seed: 1,
+            init: None,
+            split: CorpusSplit::All,
+            eval_windows: 512,
+            save_every: 0,
         }
     }
 }
@@ -106,7 +120,7 @@ pub fn run(
     out: &Path,
 ) -> Result<TrainReport> {
     let started = Instant::now();
-    let corpus = Corpus::load(data, file_limit)?;
+    let corpus = Corpus::load_split(data, file_limit, config.split)?;
     let stride = if config.stride == 0 {
         config.seq_len
     } else {
@@ -131,9 +145,15 @@ pub fn run(
     let val_windows = val.len();
 
     let device = Device::Cpu;
-    let varmap = VarMap::new();
+    let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = EventModel::new(vb, &config.model)?;
+    if let Some(init) = &config.init {
+        varmap
+            .load(init)
+            .with_context(|| format!("cannot initialise from {}", init.display()))?;
+        println!("initialised weights from {}", init.display());
+    }
     let parameters = count_parameters(&varmap);
 
     let mut optimizer = AdamW::new(
@@ -192,6 +212,22 @@ pub fn run(
                 );
             }
 
+            if config.save_every > 0 && steps % config.save_every == 0 {
+                save_checkpoint(
+                    &varmap,
+                    out,
+                    &CheckpointInfo {
+                        model: config.model,
+                        steps,
+                        epochs: epoch + 1,
+                        final_loss: latest_loss,
+                        corpus_events: corpus.events,
+                        seq_len: config.seq_len,
+                    },
+                )?;
+                println!("saved checkpoint after {steps} steps");
+            }
+
             if config.max_steps > 0 && steps >= config.max_steps {
                 epochs_done = epoch + 1;
                 break 'epochs;
@@ -207,20 +243,10 @@ pub fn run(
         epochs_done = epoch + 1;
 
         if !val.is_empty() {
-            let value = evaluate(&model, val, config)?;
+            let value = evaluate(&model, val, config, config.eval_windows)?;
             println!("epoch {epoch} validation loss {value:.4}");
         }
     }
-
-    if let Some(parent) = out.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create {}", parent.display()))?;
-        }
-    }
-    varmap
-        .save(out)
-        .with_context(|| format!("cannot save checkpoint {}", out.display()))?;
 
     let info = CheckpointInfo {
         model: config.model,
@@ -230,15 +256,13 @@ pub fn run(
         corpus_events: corpus.events,
         seq_len: config.seq_len,
     };
-    let info_path = out.with_extension("json");
-    std::fs::write(&info_path, serde_json::to_vec_pretty(&info)?)
-        .with_context(|| format!("cannot write {}", info_path.display()))?;
+    save_checkpoint(&varmap, out, &info)?;
 
-    let train_loss = evaluate(&model, train, config)?;
+    let train_loss = evaluate(&model, train, config, config.eval_windows)?;
     let val_loss = if val.is_empty() {
         f64::NAN
     } else {
-        evaluate(&model, val, config)?
+        evaluate(&model, val, config, config.eval_windows)?
     };
 
     Ok(TrainReport {
@@ -274,15 +298,25 @@ fn forward_loss(model: &EventModel, batch: &Batch, seq_len: usize) -> Result<Ten
     Ok((total / 4.0)?)
 }
 
-/// Mean loss over all windows, without gradients.
-fn evaluate(model: &EventModel, windows: &[Vec<Event>], config: &TrainConfig) -> Result<f64> {
+/// Mean loss over up to `max_windows` windows, without gradients.
+fn evaluate(
+    model: &EventModel,
+    windows: &[Vec<Event>],
+    config: &TrainConfig,
+    max_windows: usize,
+) -> Result<f64> {
     if windows.is_empty() {
         return Ok(f64::NAN);
     }
+    let take = if max_windows == 0 {
+        windows.len()
+    } else {
+        windows.len().min(max_windows)
+    };
     let device = Device::Cpu;
     let mut total = 0.0;
     let mut batches = 0.0;
-    for chunk in windows.chunks(config.batch_size.max(1)) {
+    for chunk in windows[..take].chunks(config.batch_size.max(1)) {
         let ids: Vec<usize> = (0..chunk.len()).collect();
         let batch = make_batch(windows, &ids, config.seq_len, &device)?;
         let loss = forward_loss(model, &batch, config.seq_len)?;
@@ -290,6 +324,23 @@ fn evaluate(model: &EventModel, windows: &[Vec<Event>], config: &TrainConfig) ->
         batches += 1.0;
     }
     Ok(total / batches)
+}
+
+/// Write weights plus the JSON sidecar that records their shape.
+pub(crate) fn save_checkpoint(varmap: &VarMap, out: &Path, info: &CheckpointInfo) -> Result<()> {
+    if let Some(parent) = out.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+        }
+    }
+    varmap
+        .save(out)
+        .with_context(|| format!("cannot save checkpoint {}", out.display()))?;
+    let info_path = out.with_extension("json");
+    std::fs::write(&info_path, serde_json::to_vec_pretty(info)?)
+        .with_context(|| format!("cannot write {}", info_path.display()))?;
+    Ok(())
 }
 
 /// Build tensors for a batch. Each window has `seq_len + 1` events: the first
@@ -344,11 +395,7 @@ fn make_batch(
 
 /// Load a checkpoint and the shapes recorded next to it.
 pub fn load_checkpoint(path: &Path) -> Result<(EventModel, VarMap, CheckpointInfo)> {
-    let info_path = path.with_extension("json");
-    let text = std::fs::read_to_string(&info_path)
-        .with_context(|| format!("cannot read {}", info_path.display()))?;
-    let info: CheckpointInfo =
-        serde_json::from_str(&text).context("checkpoint metadata is not valid JSON")?;
+    let info = read_checkpoint_info(path)?;
 
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
@@ -358,6 +405,14 @@ pub fn load_checkpoint(path: &Path) -> Result<(EventModel, VarMap, CheckpointInf
         .load(path)
         .with_context(|| format!("cannot load weights {}", path.display()))?;
     Ok((model, varmap, info))
+}
+
+/// Read only the JSON sidecar (shapes and run metadata).
+pub fn read_checkpoint_info(path: &Path) -> Result<CheckpointInfo> {
+    let info_path = path.with_extension("json");
+    let text = std::fs::read_to_string(&info_path)
+        .with_context(|| format!("cannot read {}", info_path.display()))?;
+    serde_json::from_str(&text).context("checkpoint metadata is not valid JSON")
 }
 
 /// Class counts, used by the trainer and sampler to sanity-check the vocabulary.

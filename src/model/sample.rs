@@ -85,6 +85,17 @@ pub fn generate(model: &EventModel, prompt: &[Event], config: &SampleConfig) -> 
         let velocity = sample(&current.velocity, temperature, &mut rng, None)?;
 
         let event = Event::from_bins(dt_bin, kind, pitch, velocity);
+        // Clamp so the piece never overshoots max_seconds; the final event is
+        // allowed to end exactly at the limit.
+        let event = if time + event.dt > config.max_seconds {
+            let remaining = (config.max_seconds - time).max(0.0);
+            Event {
+                dt: remaining,
+                ..event
+            }
+        } else {
+            event
+        };
         time += event.dt;
         events.push(event);
 
