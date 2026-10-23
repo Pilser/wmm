@@ -1,0 +1,7 @@
+/target
+/data
+/runs
+/assets
+*.wav
+*.mid
+!assets/.gitkeep
